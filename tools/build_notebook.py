@@ -498,17 +498,19 @@ md(r'''
 
 - **音源**: アップロード / Colab 内のパス / URL のいずれか。`SONG_START_SEC`・`SONG_DURATION_SEC` で一部だけを使うこともできます（試運転に便利です）。
 - **ジャンル**: FlowerDance が学習した 16 ジャンルから選びます。
+- **既定値**: 音源は `https://enabify.net/uploads/daten.mp3`（先頭 0〜120 秒）、ジャンルは `Hiphop`、歌詞はこの曲のものが入っています。
 - **歌詞**: 1 行 = 1 フレーズで貼り付けます。`[サビ]` `【Aメロ】` のような括弧だけの行はセクション名として扱います。
 - **OpenRouter**: シークレット `OPENROUTER_API_KEY` を読み込み、モデル名が存在するか確認します。
 ''')
 
 code(r'''
 # @title 3-1. 音源とジャンル
-AUDIO_SOURCE = "upload"  # @param ["upload", "path", "url"]
-AUDIO_PATH_OR_URL = ""  # @param {type:"string"}
+AUDIO_SOURCE = "url"  # @param ["upload", "path", "url"]
+AUDIO_PATH_OR_URL = "https://enabify.net/uploads/daten.mp3"  # @param {type:"string"}
 SONG_START_SEC = 0.0  # @param {type:"number"}
-SONG_DURATION_SEC = 0.0  # @param {type:"number"}
-GENRE = "Korean"  # @param ["Dai", "ShenYun", "Wei", "Korean", "Urban", "Hiphop", "Popping", "Miao", "HanTang", "Breaking", "Kun", "Locking", "Jazz", "Choreography", "Chinese", "DunHuang"]
+SONG_DURATION_SEC = 120.0  # @param {type:"number"}
+# SONG_DURATION_SEC = 0 で最後まで。区間を切り出したときは、区間外の歌詞の行は 4-2 で自動的に「未整列」になります。
+GENRE = "Hiphop"  # @param ["Dai", "ShenYun", "Wei", "Korean", "Urban", "Hiphop", "Popping", "Miao", "HanTang", "Breaking", "Kun", "Locking", "Jazz", "Choreography", "Chinese", "DunHuang"]
 SEED = 2026  # @param {type:"integer"}
 
 os.makedirs(f"{WORK}/input", exist_ok=True)
@@ -522,11 +524,15 @@ if AUDIO_SOURCE == "upload":
         f.write(up[next(iter(up))])
 elif AUDIO_SOURCE == "url":
     import requests
-    src = f"{WORK}/input/download_audio"
+    from urllib.parse import urlparse
+    name = os.path.basename(urlparse(AUDIO_PATH_OR_URL).path) or "download_audio"
+    src = f"{WORK}/input/{name}"
     with requests.get(AUDIO_PATH_OR_URL, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(src, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    print(f"downloaded {AUDIO_PATH_OR_URL} ({os.path.getsize(src) / 2**20:.1f} MB)")
 else:
     src = AUDIO_PATH_OR_URL
     assert os.path.exists(src), f"ファイルがありません: {src}"
@@ -542,10 +548,14 @@ cmd += ["-ac", "2", "-ar", "44100", SONG]
 subprocess.run(cmd, check=True)
 import librosa
 DURATION = librosa.get_duration(path=SONG)
+FULL_DURATION = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                                      "default=nw=1:nk=1", src], capture_output=True, text=True).stdout.strip() or 0)
 fr.genre_id(GENRE)  # ジャンル名の確認
 save_json("inputs.json", {"song": SONG, "source": src, "start": SONG_START_SEC, "duration": DURATION,
-                          "genre": GENRE, "seed": SEED})
-print(f"song: {SONG}  ({DURATION:.1f} s), genre: {GENRE}")
+                          "full_duration": FULL_DURATION, "genre": GENRE, "seed": SEED,
+                          "cut_start": SONG_START_SEC > 0,
+                          "cut_end": FULL_DURATION > 0 and SONG_START_SEC + DURATION < FULL_DURATION - 0.5})
+print(f"song: {SONG}  ({DURATION:.1f} s of {FULL_DURATION:.1f} s), genre: {GENRE}")
 display(Audio(SONG))
 ''')
 
@@ -554,32 +564,69 @@ code(r'''
 LYRICS_LANGUAGE = "ja"  # @param ["ja", "en"]
 LYRICS_FILE = ""  # @param {type:"string"}
 
-SAMPLE_LYRICS = """
-[Aメロ]
-朝の光が 窓をたたく
-まだ眠い目を こすって歩く
-[サビ]
-手を伸ばして 空へ届け
-君と踊る この瞬間を
-回る世界で 笑い合おう
-ずっと ずっと 輝いて
-"""
-
 LYRICS = """
-[Aメロ]
-朝の光が 窓をたたく
-まだ眠い目を こすって歩く
-[サビ]
-手を伸ばして 空へ届け
-君と踊る この瞬間を
-回る世界で 笑い合おう
-ずっと ずっと 輝いて
+あの日林檎の木の下共犯で
+踏み越えてみた境界線
+すぐに black out あ、お怒りで
+追い立てられてこんな次元へ
+俺とした事が 俺如きですら
+俺に限っていや、まさかね
+君のせいにした 秘密を手にした
+イチジクの葉が右左
+
+あっという間、目が醒める
+かと思えば空に落ちて行く
+なんというか、やめられぬ
+もうひと齧り
+
+Again, fallin', falling, 螺旋状に
+堕ちてゆく摩天楼に
+今 fallin', falling, 二人ぼっち
+気づかないカーテンコールにも
+Yeah, yeah, yeah, yeah, yeah どこまでも
+Yeah, yeah, yeah, yeah, yeah この身任せて
+いつの間に傷が埋まってくyeah
+
+そこじゃ何から何までごった煮で
+鬼も仏もおんなじ目
+全て shut out どうかしてる？
+俺らハナから大真面目 ayy
+ふりほどいて来たうしろ指ですら
+むしろ追い風さまだ足んねぇ
+蛇に睨まれた歴史の徒花
+エデンにはまだ空室あり
+
+あっという間染められる
+かと思えば熱が醒めていく
+ちょっと待ってその前に
+もうひと雫
+
+Again, fallin', falling, 螺旋状に
+堕ちてゆく摩天楼に
+今 fallin', falling, 二人ぼっち
+気づかないカーテンコールにも
+Yeah, yeah, yeah, yeah, yeah どこまでも
+Yeah, yeah, yeah, yeah, yeah この身任せて
+いつの間に傷が埋まってくyeah
+
+Again, fallin', falling, 螺旋状に
+堕ちてゆく摩天楼に
+今 fallin', falling, 二人ぼっち
+気づかないカーテンコールにも
+Yeah, yeah, yeah, yeah, yeah どこまでも
+Yeah, yeah, yeah, yeah, yeah この身任せて
+いつの間に傷が埋まってく
+
+この血が冷めないうちに飲み干して
+眩暈するほど気取って
+取り留めない出会いに色付けて
+この目が醒めないうちに憑り込んで
+狭い空ごと突き抜けて falling
+蜜の味二人ハマってく yeah
 """
 
 if LYRICS_FILE:
     LYRICS = open(LYRICS_FILE, encoding="utf-8").read()
-if LYRICS.strip() == SAMPLE_LYRICS.strip():
-    print("⚠ サンプルの歌詞のままです。曲の歌詞に書き換えてから実行してください。")
 parsed = la.parse_lyrics(LYRICS)
 save_json("lyrics_input.json", {"text": LYRICS, "language": LYRICS_LANGUAGE})
 display(pd.DataFrame(parsed))
@@ -626,9 +673,12 @@ md(r'''
 
 code(r'''
 # @title 4-2. 整列の実行
-lyr = load_json("lyrics_input.json")
+lyr = load_json("lyrics_input.json"); inp = load_json("inputs.json")
 VOCALS = f"{WORK}/stems/vocals.wav"
-lines_raw, words_raw, align_info = la.align_lyrics(VOCALS, lyr["text"], lyr["language"], DEVICE, refine=True)
+# 曲の一部だけを処理しているときは、区間の前後で歌われる行を無理に当てはめず「未整列」にする
+lines_raw, words_raw, align_info = la.align_lyrics(VOCALS, lyr["text"], lyr["language"], DEVICE, refine=True,
+                                                   free_start=inp.get("cut_start", False),
+                                                   free_end=inp.get("cut_end", False))
 free_gpu()
 save_json("align_raw.json", {"lines": lines_raw, "words": words_raw, "info": align_info})
 print(align_info)

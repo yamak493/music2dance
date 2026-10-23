@@ -46,3 +46,21 @@ def test_overrides_rescale_words():
     words = [{"line": 0, "text": "a", "start": 1.0, "end": 1.5}, {"line": 0, "text": "b", "start": 1.5, "end": 2.0}]
     la.apply_overrides(lines, words, {0: (10.0, 12.0)}, 0.5)
     assert words[1]["start"] == 11.5 and lines[0]["end"] == 12.5
+
+
+def test_free_end_leaves_unsung_lines_unaligned():
+    """Only part of the song is processed: later lines must not be squeezed into the audio."""
+    lines = la.parse_lyrics("君の笑顔が\n夜空に星\nずっとはろ")
+    dic = _dict()
+    toks, words = la.build_tokens(lines, dic, "ja")
+    sung = [t for t in toks if t["line"] < 2]          # the audio ends after line 1
+    T, V = 120, len(dic)
+    logp = np.full((T, V), -8.0)
+    logp[:, 0] = -0.05
+    for k, tk in enumerate(sung):
+        logp[10 + 5 * k, :] = -8.0
+        logp[10 + 5 * k, tk["id"]] = -0.05
+    la.global_align(toks, words, lines, logp, 0.02, 0, free_end=True)
+    assert lines[0]["start"] is not None and lines[1]["start"] is not None
+    assert lines[2]["start"] is None and all(w["start"] is None for w in words if w["line"] == 2)
+    assert abs(lines[1]["end"] - (10 + 5 * (len(sung) - 1) + 1) * 0.02) < 1e-6

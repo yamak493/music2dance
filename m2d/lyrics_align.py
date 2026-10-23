@@ -160,20 +160,27 @@ def compute_emissions(model, meta, audio16k, device, window_s=20.0, pad_s=1.0):
 
 
 # ---------------------------------------------------------------------------- Viterbi CTC
-def ctc_force_align(logp, labels, blank):
-    """Viterbi forced alignment. logp: (T, V); labels: (N,). Returns per-label (start, end, score) frames."""
+def ctc_force_align(logp, labels, blank, free_start=False, free_end=False):
+    """Viterbi forced alignment. logp: (T, V); labels: (N,). Returns per-label (start, end, score) frames.
+
+    free_start / free_end: the audio may begin after the first / stop before the last label (a cut-out
+    section of the song). Labels outside the audio are left unaligned (start = end = -1).
+    """
     T, N = logp.shape[0], len(labels)
     S = 2 * N + 1
     ext = np.full(S, blank, dtype=np.int64)
     ext[1::2] = labels
     allow2 = np.zeros(S, dtype=bool)
     allow2[3::2] = np.asarray(labels[1:]) != np.asarray(labels[:-1])
-    if T < N:
+    if T < N and not (free_start or free_end):
         raise ValueError(f"audio too short for the lyrics ({T} frames < {N} tokens)")
     neg = -1e30
     dp = np.full(S, neg)
-    dp[0] = logp[0, blank]
-    dp[1] = logp[0, ext[1]]
+    if free_start:
+        dp[:] = logp[0, ext]  # may enter the label sequence anywhere
+    else:
+        dp[0] = logp[0, blank]
+        dp[1] = logp[0, ext[1]]
     bp = np.zeros((T, S), dtype=np.int8)
     for t in range(1, T):
         c0 = dp
@@ -184,7 +191,10 @@ def ctc_force_align(logp, labels, blank):
         arg = stack.argmax(0)
         dp = stack[arg, np.arange(S)] + logp[t, ext]
         bp[t] = arg
-    s = int(S - 1 if dp[S - 1] >= dp[S - 2] else S - 2)
+    if free_end:
+        s = int(np.argmax(dp))  # may leave the label sequence anywhere
+    else:
+        s = int(S - 1 if dp[S - 1] >= dp[S - 2] else S - 2)
     path = np.empty(T, dtype=np.int64)
     for t in range(T - 1, -1, -1):
         path[t] = s
@@ -238,11 +248,11 @@ def _assign_times(tokens, words, lines, frame_dur, t_offset=0.0):
     return words, lines
 
 
-def global_align(tokens, words, lines, logp, frame_dur, blank):
+def global_align(tokens, words, lines, logp, frame_dur, blank, free_start=False, free_end=False):
     if not tokens:
         raise ValueError("No lyric character exists in the alignment model's vocabulary")
     labels = np.array([t["id"] for t in tokens], dtype=np.int64)
-    st, en, sc = ctc_force_align(logp, labels, blank)
+    st, en, sc = ctc_force_align(logp, labels, blank, free_start, free_end)
     for t, a, b, s in zip(tokens, st, en, sc):
         t["start"], t["end"], t["score"] = (float(a * frame_dur), float(b * frame_dur), float(s)) if a >= 0 else (None, None, -99.0)
     return _assign_times(tokens, words, lines, frame_dur)
@@ -259,8 +269,8 @@ def whisperx_refine(model, meta, audio16k, tokens, words, lines, device, languag
         if ln.get("start") is None:
             continue
         ltoks = [t for t in tokens if t["line"] == ln["index"] and not t.get("is_sep")]
-        if not ltoks:
-            continue
+        if not ltoks or any(t.get("start") is None for t in ltoks):
+            continue  # partly outside the processed section: keep the global alignment
         text = "".join(t["char"] for t in ltoks) if language == "ja" else ln["text"]
         seg = [{"start": max(0.0, ln["start"] - pad), "end": min(dur, ln["end"] + pad), "text": text}]
         try:
@@ -327,8 +337,13 @@ def apply_overrides(lines, words, line_overrides=None, global_offset=0.0):
     return lines, words
 
 
-def align_lyrics(vocals_path, lyrics_text, language="ja", device="cuda", refine=True, log=print):
-    """Full step 2. Returns (lines, words, info)."""
+def align_lyrics(vocals_path, lyrics_text, language="ja", device="cuda", refine=True, free_start=False,
+                 free_end=False, log=print):
+    """Full step 2. Returns (lines, words, info).
+
+    free_start / free_end: set when only a section of the song is processed, so that lyric lines sung
+    before / after that section stay unaligned instead of being squeezed into it.
+    """
     import gc
 
     import librosa
@@ -341,7 +356,10 @@ def align_lyrics(vocals_path, lyrics_text, language="ja", device="cuda", refine=
     if missing:
         log(f"[warn] lines without alignable characters: {missing}")
     logp, frame_dur = compute_emissions(model, meta, audio, device)
-    global_align(tokens, words, lines, logp, frame_dur, blank_id(meta))
+    global_align(tokens, words, lines, logp, frame_dur, blank_id(meta), free_start, free_end)
+    outside = [ln["index"] for ln in lines if ln.get("start") is None]
+    if outside:
+        log(f"lines not found in this section of the song (left unaligned): {outside}")
     n_ref = 0
     if refine:
         try:
@@ -349,6 +367,7 @@ def align_lyrics(vocals_path, lyrics_text, language="ja", device="cuda", refine=
         except ImportError as e:
             log(f"[warn] whisperx is not importable ({e!r}); using the global alignment only")
     info = {"tokens": len(tokens), "frames": int(logp.shape[0]), "frame_dur": frame_dur, "refined_lines": n_ref,
+            "unaligned_lines": outside,
             "loader": meta.get("loader"), "model_type": meta.get("type")}
     del model, logp
     gc.collect()
