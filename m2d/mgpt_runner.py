@@ -88,17 +88,21 @@ def load_model(repo, ckpt, device):
     from motGPT.data.build_data import build_data
     from motGPT.models.build_model import build_model
     base = importlib.import_module("motGPT.models.base")
-    base.BaseModel.configure_metrics = lambda self: None
+    # The evaluation metrics are replaced by an empty module (BaseModel code still refers to self.metrics).
+    base.BaseModel.configure_metrics = lambda self: setattr(self, "metrics", sys.modules["motGPT.metrics"].BaseMetrics())
     cfg = build_cfg()
     datamodule = build_data(cfg, phase="test")
     model = build_model(cfg, datamodule).eval()
     if ckpt:
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
         state = state.get("state_dict", state)
-        res = model.load_state_dict(state, strict=False)
+        # BaseModel.load_state_dict needs the real metrics and returns nothing, so use nn.Module's loader
+        # on the network weights only (evaluation-metric and loss buffers are not used for generation).
         ignore = ("metrics.", "_losses.")
+        state = {k: v for k, v in state.items() if not k.startswith(ignore) and "Metrics" not in k}
+        res = torch.nn.Module.load_state_dict(model, state, strict=False)
         missing = [k for k in res.missing_keys if not k.startswith(ignore)]
-        unexpected = [k for k in res.unexpected_keys if not k.startswith(ignore)]
+        unexpected = list(res.unexpected_keys)
         print(f"[MotionGPT3] loaded {ckpt}: missing={len(missing)} unexpected={len(unexpected)}")
         core_missing = [k for k in missing if k.startswith(("lm.", "vae."))]
         if core_missing:
