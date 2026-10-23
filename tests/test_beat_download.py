@@ -33,22 +33,29 @@ def _ckpt_bytes():
     return buf.getvalue()
 
 
-def test_retry_then_second_endpoint(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def _fake_hash(monkeypatch):
+    import hashlib
+    monkeypatch.setitem(aa.BEAT_THIS_SHA256, "final0", hashlib.sha256(_ckpt_bytes()).hexdigest())
+
+
+def test_falls_back_to_mirror_and_checks_hash(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.hub, "get_dir", lambda: str(tmp_path))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     calls = []
 
     def fake_get(url, **kw):
         calls.append(url)
-        if len(calls) <= 2:          # first round: both endpoints answer 503
+        if "cloud.cp.jku.at" in url:   # authors' host down
             return _Resp(503)
-        if "public.php" in url:      # second round: WebDAV still down, share link works
-            return _Resp(503)
-        return _Resp(200, _ckpt_bytes())
+        if "github.com" in url:        # first mirror serves a corrupted file -> rejected by SHA-256
+            return _Resp(200, b"x" * 2_000_000)
+        return _Resp(200, _ckpt_bytes())  # second mirror OK
 
     monkeypatch.setattr(requests, "get", fake_get)
     path = aa.ensure_beat_this_checkpoint("final0", log=lambda *a: None)
-    assert path.endswith("checkpoints/beat_this-final0.ckpt") and len(calls) == 4
+    assert path.endswith("checkpoints/beat_this-final0.ckpt")
+    assert [u.split("/")[2] for u in calls] == ["cloud.cp.jku.at", "cloud.cp.jku.at", "github.com", "huggingface.co"]
     calls.clear()
     assert aa.ensure_beat_this_checkpoint("final0") == path and not calls  # cached: no network
 

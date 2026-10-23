@@ -61,12 +61,31 @@ def separate_vocals(audio_path, out_dir, model_name="htdemucs", device="cuda", s
 
 
 # ---------------------------------------------------------------------------- step 3: beat_this
-# The authors' public share (Nextcloud). Two endpoints of the same share: WebDAV (used by beat_this) and the
-# share download link, which sometimes still answers while the other returns 503.
+# The authors' public share (Nextcloud): WebDAV endpoint (used by beat_this itself) and the share link.
 BEAT_THIS_URLS = (
     "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/{name}.ckpt",
     "https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp/download?path=%2F&files={name}.ckpt",
 )
+# Mirrors of the unmodified checkpoint (MIT licensed weights), used when the authors' host is down.
+# Every download is accepted only if its SHA-256 equals the original file's hash.
+BEAT_THIS_MIRRORS = {
+    "final0": (
+        "https://github.com/zyziyun/reelfold/releases/download/models-beat-this-final0/final0.ckpt",
+        "https://huggingface.co/AEmotionStudio/muscriptor-models/resolve/main/shared/beat_this_final0.ckpt",
+    ),
+}
+BEAT_THIS_SHA256 = {
+    "final0": "8c328b45f59d8dd3dff219253ff6a8d6482be57d0133a29140e2febbf8eb8331",
+}
+
+
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def beat_this_cache_path(name="final0"):
@@ -75,9 +94,11 @@ def beat_this_cache_path(name="final0"):
     return os.path.join(torch.hub.get_dir(), "checkpoints", f"beat_this-{name}.ckpt")
 
 
-def _valid_checkpoint(path):
+def _valid_checkpoint(path, name=None):
     import torch
     if not os.path.isfile(path) or os.path.getsize(path) < 1_000_000:
+        return False
+    if name in BEAT_THIS_SHA256 and _sha256(path) != BEAT_THIS_SHA256[name]:
         return False
     try:
         ck = torch.load(path, map_location="cpu", weights_only=False)
@@ -87,7 +108,7 @@ def _valid_checkpoint(path):
 
 
 def ensure_beat_this_checkpoint(name="final0", retries=5, timeout=120, log=print):
-    """Download a beat_this checkpoint into the torch.hub cache with retries and a second endpoint.
+    """Download a beat_this checkpoint into the torch.hub cache: authors' host first, then mirrors, with retries.
 
     beat_this then finds it in the cache and never touches the network. Returns the cached path.
     """
@@ -95,13 +116,12 @@ def ensure_beat_this_checkpoint(name="final0", retries=5, timeout=120, log=print
 
     import requests
     dst = beat_this_cache_path(name)
-    if _valid_checkpoint(dst):
+    if _valid_checkpoint(dst, name):
         return dst
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     errors = []
     for attempt in range(retries):
-        for url in BEAT_THIS_URLS:
-            url = url.format(name=name)
+        for url in [u.format(name=name) for u in BEAT_THIS_URLS] + list(BEAT_THIS_MIRRORS.get(name, ())):
             try:
                 with requests.get(url, stream=True, timeout=timeout) as r:
                     r.raise_for_status()
@@ -109,10 +129,10 @@ def ensure_beat_this_checkpoint(name="final0", retries=5, timeout=120, log=print
                         for chunk in r.iter_content(1 << 20):
                             f.write(chunk)
                 os.replace(dst + ".part", dst)
-                if _valid_checkpoint(dst):
-                    log(f"beat_this {name}: downloaded from {url.split('/')[2]} (attempt {attempt + 1})")
+                if _valid_checkpoint(dst, name):
+                    log(f"beat_this {name}: downloaded from {url.split('/')[2]} (attempt {attempt + 1}, SHA-256 OK)")
                     return dst
-                errors.append(f"{url}: not a valid checkpoint")
+                errors.append(f"{url}: not a valid checkpoint (size/SHA-256 mismatch)")
                 os.remove(dst)
             except Exception as e:  # network errors, HTTP 5xx ...
                 errors.append(f"{url}: {e!r}")
@@ -121,10 +141,11 @@ def ensure_beat_this_checkpoint(name="final0", retries=5, timeout=120, log=print
             f"({attempt + 1}/{retries})")
         time.sleep(wait)
     raise RuntimeError(
-        f"beat_this の重み {name}.ckpt を取得できませんでした（作者のサーバー cloud.cp.jku.at の不調の可能性）。\n"
+        f"beat_this の重み {name}.ckpt を作者のサーバーからもミラーからも取得できませんでした。\n"
         f"  1) 時間をおいて再実行する\n"
-        f"  2) ブラウザで https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp から {name}.ckpt をダウンロードし、\n"
-        f"     {dst} にアップロードする\n"
+        f"  2) ブラウザで次のどれかから {name}.ckpt をダウンロードし、{dst} にアップロードする\n"
+        f"     https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp\n"
+        + "".join(f"     {u}\n" for u in BEAT_THIS_MIRRORS.get(name, ())) +
         f"  3) 4-4 で BEAT_TRACKER = 'librosa' を選ぶ（精度は下がります）\n"
         f"last errors: {errors[-2:]}")
 
