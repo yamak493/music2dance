@@ -382,7 +382,7 @@ md(r'''
 | FlowerDance | Hugging Face `xlt99/FlowerDance`（`train-3700.pt`） | 1GB 未満 |
 | Demucs htdemucs | Hugging Face（demucs 4.1 が自動取得） | 約 0.3GB |
 | wav2vec2（日本語） | `jonatasgrosman/wav2vec2-large-xlsr-53-japanese`（WhisperX の既定） | 約 1.2GB |
-| beat_this `final0` | 作者の公開ストレージ（自動取得） | 0.1GB 未満 |
+| beat_this `final0` | 作者の公開ストレージ（自動取得、失敗時は再試行） | 0.1GB 未満 |
 | MotionGPT3 | Hugging Face `OpenMotionLab/motiongpt3`（失敗時は作者の Google Drive 公開リンク） | 約 1〜2GB |
 | GPT-2（MotionGPT3 の言語部分） | `openai-community/gpt2` | 約 0.5GB |
 
@@ -407,9 +407,12 @@ from demucs.pretrained import get_model as demucs_get_model
 _ = demucs_get_model("htdemucs"); del _
 print("Demucs htdemucs: OK")
 
-from beat_this.inference import load_checkpoint as beat_this_load
-_ = beat_this_load("final0"); del _
-print("beat_this final0: OK")
+# 作者の公開サーバー（cloud.cp.jku.at）は一時的に 503 を返すことがあるため、再試行つきで取得する。
+# 取得できなくても他のモデルのダウンロードは続け、4-4 でもう一度試す。
+try:
+    print("beat_this final0: OK", aa.ensure_beat_this_checkpoint("final0"))
+except RuntimeError as e:
+    print("[warn]", e)
 
 ALIGN_MODEL_JA = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"
 snapshot_download(ALIGN_MODEL_JA, token=HF_TOKEN)
@@ -696,8 +699,14 @@ md(r'''
 
 code(r'''
 # @title 4-4. ビート検出
+BEAT_TRACKER = "beat_this"  # @param ["beat_this", "librosa"]
+# "librosa" は beat_this の重みがどうしても取得できないときの最終手段（ダウンビートの精度が下がります）
 SONG = load_json("inputs.json")["song"]; lines = load_json("lyrics_lines.json")
-beats, downbeats = aa.detect_beats(SONG, checkpoint="final0", device=DEVICE)
+if BEAT_TRACKER == "beat_this":
+    beats, downbeats = aa.detect_beats(SONG, checkpoint="final0", device=DEVICE)
+else:
+    print("⚠ librosa でビートを検出します（beat_this の代替）。4-5 のクリック音で 8 カウントを必ず確認してください。")
+    beats, downbeats = aa.detect_beats_librosa(SONG)
 free_gpu()
 save_json("beats.json", {"beats": beats.tolist(), "downbeats": downbeats.tolist()})
 print(f"beats: {len(beats)}, downbeats: {len(downbeats)}, tempo ≈ {aa.tempo_from_beats(beats):.1f} BPM")
@@ -1148,6 +1157,7 @@ md(r'''
 | 8 カウントの「1」がずれている | 4-5 で `GRID_PHASE` を `0` / `1` に固定します。 |
 | ジェスチャーが薄い・見えない | 7-4 で `GESTURE_MASK_MODE="strict"`、または `EXAGGERATION` を上げます。 |
 | ジェスチャーが不自然・跳ねる | 7-3 で変換結果を確認し、5-2 で `motion_description` を具体的に書き直すか、`scope` を `upper` にします。 |
+| 2-1 / 4-4 で beat_this の重みが取得できない（HTTP 503 など） | 作者のサーバーの一時的な不調です。時間をおいて再実行するか、ブラウザで https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp から `final0.ckpt` を取得して `/content/models/torch/hub/checkpoints/beat_this-final0.ckpt` にアップロードします。最終手段は 4-4 の `BEAT_TRACKER="librosa"` です。 |
 | OpenRouter のモデルが無い | 3-3 に表示される候補から `OPENROUTER_MODEL` を選び直します。 |
 | MotionGPT3 のダウンロードに失敗 | Hugging Face の `OpenMotionLab/motiongpt3` から `.ckpt` を手動で取得し、`/content/models/motiongpt3/` に置いてから 2-2 を再実行します。 |
 

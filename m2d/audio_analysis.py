@@ -61,14 +61,103 @@ def separate_vocals(audio_path, out_dir, model_name="htdemucs", device="cuda", s
 
 
 # ---------------------------------------------------------------------------- step 3: beat_this
+# The authors' public share (Nextcloud). Two endpoints of the same share: WebDAV (used by beat_this) and the
+# share download link, which sometimes still answers while the other returns 503.
+BEAT_THIS_URLS = (
+    "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/{name}.ckpt",
+    "https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp/download?path=%2F&files={name}.ckpt",
+)
+
+
+def beat_this_cache_path(name="final0"):
+    """Where torch.hub (and therefore beat_this) looks for the downloaded checkpoint."""
+    import torch
+    return os.path.join(torch.hub.get_dir(), "checkpoints", f"beat_this-{name}.ckpt")
+
+
+def _valid_checkpoint(path):
+    import torch
+    if not os.path.isfile(path) or os.path.getsize(path) < 1_000_000:
+        return False
+    try:
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        return isinstance(ck, dict) and "state_dict" in ck
+    except Exception:
+        return False
+
+
+def ensure_beat_this_checkpoint(name="final0", retries=5, timeout=120, log=print):
+    """Download a beat_this checkpoint into the torch.hub cache with retries and a second endpoint.
+
+    beat_this then finds it in the cache and never touches the network. Returns the cached path.
+    """
+    import time
+
+    import requests
+    dst = beat_this_cache_path(name)
+    if _valid_checkpoint(dst):
+        return dst
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    errors = []
+    for attempt in range(retries):
+        for url in BEAT_THIS_URLS:
+            url = url.format(name=name)
+            try:
+                with requests.get(url, stream=True, timeout=timeout) as r:
+                    r.raise_for_status()
+                    with open(dst + ".part", "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                os.replace(dst + ".part", dst)
+                if _valid_checkpoint(dst):
+                    log(f"beat_this {name}: downloaded from {url.split('/')[2]} (attempt {attempt + 1})")
+                    return dst
+                errors.append(f"{url}: not a valid checkpoint")
+                os.remove(dst)
+            except Exception as e:  # network errors, HTTP 5xx ...
+                errors.append(f"{url}: {e!r}")
+        wait = min(60, 5 * 2 ** attempt)
+        log(f"beat_this {name}: download failed ({errors[-1][:120]}); retrying in {wait}s "
+            f"({attempt + 1}/{retries})")
+        time.sleep(wait)
+    raise RuntimeError(
+        f"beat_this の重み {name}.ckpt を取得できませんでした（作者のサーバー cloud.cp.jku.at の不調の可能性）。\n"
+        f"  1) 時間をおいて再実行する\n"
+        f"  2) ブラウザで https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp から {name}.ckpt をダウンロードし、\n"
+        f"     {dst} にアップロードする\n"
+        f"  3) 4-4 で BEAT_TRACKER = 'librosa' を選ぶ（精度は下がります）\n"
+        f"last errors: {errors[-2:]}")
+
+
 def detect_beats(audio_path, checkpoint="final0", device="cuda", dbn=False):
     from beat_this.inference import Audio2Beats
+    ensure_beat_this_checkpoint(checkpoint)
     y, sr = load_audio(audio_path, sr=None, mono=True)
     a2b = Audio2Beats(checkpoint_path=checkpoint, device=device, dbn=dbn)
     beats, downbeats = a2b(y, sr)
     del a2b
     _free()
     return np.asarray(beats, dtype=np.float64), np.asarray(downbeats, dtype=np.float64)
+
+
+def detect_beats_librosa(audio_path, beats_per_bar=4):
+    """Last-resort fallback: librosa beat tracking + downbeat phase from low-frequency onset strength."""
+    import librosa
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    hop = 512
+    _, perc = librosa.effects.hpss(y)
+    env = librosa.onset.onset_strength(y=perc, sr=sr, hop_length=hop)
+    _, beat_frames = librosa.beat.beat_track(onset_envelope=env, sr=sr, hop_length=hop, tightness=100)
+    beats = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop)
+    if len(beats) < beats_per_bar * 2:
+        return beats, beats[::beats_per_bar]
+    # kick drums mostly land on the first beat of a bar: compare low-band onset strength per phase
+    S = np.abs(librosa.stft(perc, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=sr)
+    low = librosa.onset.onset_strength(S=librosa.amplitude_to_db(S[freqs < 150]), sr=sr, hop_length=hop)
+    strength = low[np.clip(beat_frames, 0, len(low) - 1)]
+    phase = int(np.argmax([strength[p::beats_per_bar].mean() for p in range(beats_per_bar)]))
+    return np.asarray(beats, dtype=np.float64), np.asarray(beats[phase::beats_per_bar], dtype=np.float64)
 
 
 def tempo_from_beats(beats):
